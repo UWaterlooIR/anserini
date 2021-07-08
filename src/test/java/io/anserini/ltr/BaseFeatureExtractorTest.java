@@ -1,5 +1,5 @@
 /*
- * Anserini: A Lucene toolkit for replicable information retrieval research
+ * Anserini: A Lucene toolkit for reproducible information retrieval research
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,14 +18,17 @@ package io.anserini.ltr;
 
 import io.anserini.analysis.AnalyzerUtils;
 import io.anserini.index.IndexArgs;
-import io.anserini.ltr.feature.FeatureExtractor;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.analysis.en.EnglishAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.StringField;
-import org.apache.lucene.index.*;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.lucene.util.LuceneTestCase;
@@ -33,7 +36,8 @@ import org.junit.After;
 import org.junit.Before;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 
 /**
@@ -42,6 +46,7 @@ import java.util.concurrent.ExecutionException;
 abstract public class BaseFeatureExtractorTest<T> extends LuceneTestCase {
   protected static final String TEST_FIELD_NAME = IndexArgs.CONTENTS;
   protected static final Analyzer TEST_ANALYZER = new EnglishAnalyzer();
+  protected static final Analyzer NON_STOP_TEST_ANALYZER = new WhitespaceAnalyzer();
 
   // Acceptable delta for float assert
   protected static final float DELTA = 0.01f;
@@ -99,19 +104,31 @@ abstract public class BaseFeatureExtractorTest<T> extends LuceneTestCase {
    */
   protected void assertFeatureValues(float[] expected, String queryText, String docText,
                                      List<FeatureExtractor> extractors) throws IOException, ExecutionException, InterruptedException {
-    assertFeatureValues(expected, queryText, Arrays.asList(docText), extractors,0);
+    assertFeatureValues(expected, "-1", queryText, Arrays.asList(docText), extractors,0);
   }
 
   // just add a signature for single extractor
   protected void assertFeatureValues(float[] expected, String queryText, String docText,
                                      FeatureExtractor extractor) throws IOException, ExecutionException, InterruptedException {
-    assertFeatureValues(expected, queryText, Arrays.asList(docText), Arrays.asList(extractor),0);
+    assertFeatureValues(expected, "-1", queryText, Arrays.asList(docText), Arrays.asList(extractor),0);
   }
 
   // just add a signature for single extractor
   protected void assertFeatureValues(float[] expected, String queryText, List<String> docTexts,
                                      FeatureExtractor extractor, int docToExtract) throws IOException, ExecutionException, InterruptedException {
-    assertFeatureValues(expected, queryText, docTexts, Arrays.asList(extractor),docToExtract);
+    assertFeatureValues(expected, "-1" , queryText, docTexts, Arrays.asList(extractor),docToExtract);
+  }
+
+  // just add a signature for single extractor
+  protected void assertFeatureValues(float[] expected, String qid, String queryText, String docTexts,
+                                     FeatureExtractor extractor) throws IOException, ExecutionException, InterruptedException {
+    assertFeatureValues(expected, qid , queryText, Arrays.asList(docTexts), Arrays.asList(extractor),0);
+  }
+
+  // just add a signature for single extractor
+  protected void assertFeatureValues(float[] expected, String queryText, List<String> docTexts,
+                                     List<FeatureExtractor> extractors, int docToExtract) throws IOException, ExecutionException, InterruptedException {
+    assertFeatureValues(expected, "-1" , queryText, docTexts, extractors, docToExtract);
   }
 
   /**
@@ -122,23 +139,25 @@ abstract public class BaseFeatureExtractorTest<T> extends LuceneTestCase {
    * @param extractors          The chain of feature extractors to use
    * @param docToExtract        Index of the document we want to compute features for
    */
-  protected void assertFeatureValues(float[] expected, String queryText, List<String> docTexts,
+  protected void assertFeatureValues(float[] expected, String qid, String queryText, List<String> docTexts,
                                      List<FeatureExtractor> extractors, int docToExtract) throws IOException, ExecutionException, InterruptedException {
     int id = 0;
     for (String docText : docTexts) {
       addTestDocument(docText, String.format("doc%s", id));
       id += 1;
     }
-    testWriter.forceMerge(1);
+    testWriter.commit();
 
     FeatureExtractorUtils utils = new FeatureExtractorUtils(DirectoryReader.open(DIRECTORY));
     for(FeatureExtractor extractor: extractors){
       utils.add(extractor);
     }
     String docIdToExtract = String.format("doc%s", docToExtract);
-    ArrayList<output> extractedFeatureValues = utils.extract(AnalyzerUtils.analyze(TEST_ANALYZER,queryText), Arrays.asList(docIdToExtract));
+
+
+    List<debugOutput> extractedFeatureValues = utils.extract(qid, Arrays.asList(docIdToExtract), AnalyzerUtils.analyze(TEST_ANALYZER, queryText));
     List<Float> extractFeatures = null;
-    for(output doc: extractedFeatureValues) {
+    for(debugOutput doc: extractedFeatureValues) {
       if(doc.pid.equals(docIdToExtract))
         if(extractFeatures == null)
           extractFeatures = doc.features;

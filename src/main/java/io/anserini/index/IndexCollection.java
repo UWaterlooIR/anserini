@@ -1,5 +1,5 @@
 /*
- * Anserini: A Lucene toolkit for replicable information retrieval research
+ * Anserini: A Lucene toolkit for reproducible information retrieval research
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,8 @@
 
 package io.anserini.index;
 
-import com.google.common.base.Charsets;
 import com.google.common.base.Splitter;
 import com.google.common.collect.Lists;
-import com.google.common.hash.Hashing;
 import io.anserini.analysis.DefaultEnglishAnalyzer;
 import io.anserini.analysis.TweetAnalyzer;
 import io.anserini.collection.DocumentCollection;
@@ -27,6 +25,7 @@ import io.anserini.collection.FileSegment;
 import io.anserini.collection.SourceDocument;
 import io.anserini.index.generator.*;
 import io.anserini.search.similarity.AccurateBM25Similarity;
+import io.anserini.search.similarity.ImpactSimilarity;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.apache.commons.io.FileUtils;
@@ -50,14 +49,28 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.core.config.Configurator;
 import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.analysis.CharArraySet;
 import org.apache.lucene.analysis.ar.ArabicAnalyzer;
 import org.apache.lucene.analysis.bn.BengaliAnalyzer;
 import org.apache.lucene.analysis.cjk.CJKAnalyzer;
+import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
+import org.apache.lucene.analysis.da.DanishAnalyzer;
 import org.apache.lucene.analysis.de.GermanAnalyzer;
 import org.apache.lucene.analysis.es.SpanishAnalyzer;
+import org.apache.lucene.analysis.fi.FinnishAnalyzer;
 import org.apache.lucene.analysis.fr.FrenchAnalyzer;
 import org.apache.lucene.analysis.hi.HindiAnalyzer;
+import org.apache.lucene.analysis.hu.HungarianAnalyzer;
+import org.apache.lucene.analysis.id.IndonesianAnalyzer;
+import org.apache.lucene.analysis.it.ItalianAnalyzer;
+import org.apache.lucene.analysis.ja.JapaneseAnalyzer;
+import org.apache.lucene.analysis.nl.DutchAnalyzer;
+import org.apache.lucene.analysis.no.NorwegianAnalyzer;
+import org.apache.lucene.analysis.pt.PortugueseAnalyzer;
+import org.apache.lucene.analysis.ru.RussianAnalyzer;
+import org.apache.lucene.analysis.sv.SwedishAnalyzer;
+import org.apache.lucene.analysis.th.ThaiAnalyzer;
+import org.apache.lucene.analysis.tr.TurkishAnalyzer;
+
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
@@ -88,6 +101,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
@@ -718,6 +737,8 @@ public final class IndexCollection {
   private ObjectPool<SolrClient> solrPool;
   private ObjectPool<RestHighLevelClient> esPool;
 
+
+
   @SuppressWarnings("unchecked")
   public IndexCollection(IndexArgs args) throws Exception {
     this.args = args;
@@ -750,6 +771,7 @@ public final class IndexCollection {
     LOG.info("Store document \"raw\" field? " + args.storeRaw);
     LOG.info("Optimize (merge segments)? " + args.optimize);
     LOG.info("Whitelist: " + args.whitelist);
+    LOG.info("Pretokenized?: " + args.pretokenized);
 
     if (args.solr) {
       LOG.info("Indexing into Solr...");
@@ -830,45 +852,82 @@ public final class IndexCollection {
       final Directory dir = FSDirectory.open(indexPath);
       final CJKAnalyzer chineseAnalyzer = new CJKAnalyzer();
       final ArabicAnalyzer arabicAnalyzer = new ArabicAnalyzer();
-      final FrenchAnalyzer frenchAnalyzer = new FrenchAnalyzer();
-      final HindiAnalyzer hindiAnalyzer = new HindiAnalyzer();
       final BengaliAnalyzer bengaliAnalyzer = new BengaliAnalyzer();
+      final DanishAnalyzer danishAnalyzer = new DanishAnalyzer();
+      final DutchAnalyzer dutchAnalyzer = new DutchAnalyzer();
+      final FinnishAnalyzer finnishAnalyzer = new FinnishAnalyzer();
+      final FrenchAnalyzer frenchAnalyzer = new FrenchAnalyzer();
       final GermanAnalyzer germanAnalyzer = new GermanAnalyzer();
+      final HindiAnalyzer hindiAnalyzer = new HindiAnalyzer();
+      final HungarianAnalyzer hungarianAnalyzer = new HungarianAnalyzer();
+      final IndonesianAnalyzer indonesianAnalyzer = new IndonesianAnalyzer();
+      final ItalianAnalyzer italianAnalyzer = new ItalianAnalyzer();
+      final JapaneseAnalyzer japaneseAnalyzer = new JapaneseAnalyzer();
+      final NorwegianAnalyzer norwegianAnalyzer = new NorwegianAnalyzer();
+      final PortugueseAnalyzer portugueseAnalyzer = new PortugueseAnalyzer();
+      final RussianAnalyzer russianAnalyzer = new RussianAnalyzer();
       final SpanishAnalyzer spanishAnalyzer = new SpanishAnalyzer();
-      final DefaultEnglishAnalyzer analyzer;
-      if (args.keepStopwords) {
-        analyzer = DefaultEnglishAnalyzer.newStemmingInstance(args.stemmer, CharArraySet.EMPTY_SET);
-      } else if (args.stopwords != null) {
-        final List<String> stopWords = FileUtils.readLines(new File(args.stopwords), "utf-8");
-        final CharArraySet stopWordsSet = new CharArraySet(stopWords, false);
-        analyzer = DefaultEnglishAnalyzer.newStemmingInstance(args.stemmer, CharArraySet.unmodifiableSet(stopWordsSet));
-      } else {
-        analyzer = DefaultEnglishAnalyzer.newStemmingInstance(args.stemmer);
-      }
+      final SwedishAnalyzer swedishAnalyzer = new SwedishAnalyzer();
+      final ThaiAnalyzer thaiAnalyzer = new ThaiAnalyzer();
+      final TurkishAnalyzer turkishAnalyzer = new TurkishAnalyzer();
+      final WhitespaceAnalyzer whitespaceAnalyzer = new WhitespaceAnalyzer();
+
+      final DefaultEnglishAnalyzer analyzer = DefaultEnglishAnalyzer.fromArguments(
+              args.stemmer, args.keepStopwords, args.stopwords);
       final TweetAnalyzer tweetAnalyzer = new TweetAnalyzer(args.tweetStemming);
 
       final IndexWriterConfig config;
       if (args.collectionClass.equals("TweetCollection")) {
         config = new IndexWriterConfig(tweetAnalyzer);
-      } else if (args.language.equals("zh")) {
-        config = new IndexWriterConfig(chineseAnalyzer);
       } else if (args.language.equals("ar")) {
         config = new IndexWriterConfig(arabicAnalyzer);
-      } else if (args.language.equals("fr")) {
-        config = new IndexWriterConfig(frenchAnalyzer);
-      } else if (args.language.equals("hi")) {
-        config = new IndexWriterConfig(hindiAnalyzer);
       } else if (args.language.equals("bn")) {
         config = new IndexWriterConfig(bengaliAnalyzer);
+      } else if (args.language.equals("da")) {
+        config = new IndexWriterConfig(danishAnalyzer);
       } else if (args.language.equals("de")) {
         config = new IndexWriterConfig(germanAnalyzer);
       } else if (args.language.equals("es")) {
         config = new IndexWriterConfig(spanishAnalyzer);
+      } else if (args.language.equals("fi")) {
+        config = new IndexWriterConfig(finnishAnalyzer);
+      } else if (args.language.equals("fr")) {
+        config = new IndexWriterConfig(frenchAnalyzer);
+      } else if (args.language.equals("hi")) {
+        config = new IndexWriterConfig(hindiAnalyzer);
+      } else if (args.language.equals("hu")) {
+        config = new IndexWriterConfig(hungarianAnalyzer);
+      } else if (args.language.equals("id")) {
+        config = new IndexWriterConfig(indonesianAnalyzer);
+      } else if (args.language.equals("it")) {
+        config = new IndexWriterConfig(italianAnalyzer);
+      } else if (args.language.equals("ja")) {
+        config = new IndexWriterConfig(japaneseAnalyzer);
+      } else if (args.language.equals("nl")) {
+        config = new IndexWriterConfig(dutchAnalyzer);
+      } else if (args.language.equals("no")) {
+        config = new IndexWriterConfig(norwegianAnalyzer);
+      } else if (args.language.equals("pt")) {
+        config = new IndexWriterConfig(portugueseAnalyzer);
+      } else if (args.language.equals("ru")) {
+        config = new IndexWriterConfig(russianAnalyzer);
+      } else if (args.language.equals("sv")) {
+        config = new IndexWriterConfig(swedishAnalyzer);
+      } else if (args.language.equals("th")) {
+        config = new IndexWriterConfig(thaiAnalyzer);
+      } else if (args.language.equals("tr")) {
+        config = new IndexWriterConfig(turkishAnalyzer);
+      } else if (args.language.equals("zh") || args.language.equals("ko")) {
+        config = new IndexWriterConfig(chineseAnalyzer);
+      } else if (args.pretokenized) {
+        config = new IndexWriterConfig(whitespaceAnalyzer);
       } else {
         config = new IndexWriterConfig(analyzer);
       }
       if (args.bm25Accurate) {
         config.setSimilarity(new AccurateBM25Similarity()); // necessary during indexing as the norm used in BM25 is already determined at index time.
+      } if (args.impact ) {
+        config.setSimilarity(new ImpactSimilarity());
       } else {
         config.setSimilarity(new BM25Similarity());
       }
@@ -884,8 +943,14 @@ public final class IndexCollection {
     LOG.info("Thread pool with " + numThreads + " threads initialized.");
 
     LOG.info("Initializing collection in " + collectionPath.toString());
-    final List segmentPaths = collection.getSegmentPaths();
+
+    List<?> segmentPaths = collection.getSegmentPaths();
+    // when we want sharding to be done
+    if (args.shardCount > 1) {
+      segmentPaths = collection.getSegmentPaths(args.shardCount, args.shardCurrent);
+    }
     final int segmentCnt = segmentPaths.size();
+
     LOG.info(String.format("%,d %s found", segmentCnt, (segmentCnt == 1 ? "file" : "files" )));
     LOG.info("Starting to index...");
 
