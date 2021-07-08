@@ -129,6 +129,11 @@ public class IndexArgs {
   @Option(name = "-pretokenized",
           usage = "index pre-tokenized collections without any additional stemming, stopword processing")
   public boolean pretokenized = false;
+  
+  @Option(name = "-skipNonEnglish",
+          usage = "Boolean to skip non-English documents.")
+  public boolean skipNonEnglish = false;
+
 
   // Tweet options
 
@@ -228,6 +233,9 @@ public class IndexArgs {
       usage = "Elasticsearch (low level) REST client socket timeout (in ms).")
   public int esSocketTimeout = TIMEOUT;
 
+  @Option(name = "-es.ssl", usage = "Boolean to use SSL for Elasticsearch.")
+  public boolean esSSL = false;
+
   // Sharding options
 
   @Option(name = "-shard.count", metaVar = "[n]",
@@ -237,4 +245,11 @@ public class IndexArgs {
   @Option(name = "-shard.current", metaVar = "[n]",
       usage = "The current shard number to generate (indexed from 0).")
   public int shardCurrent = -1;
+
+  // Compress options
+
+  @Option(name = "-compress.path", metaVar = "[path]",
+      usage = "compress content path.")
+  public String compressPath = null;
+
 }

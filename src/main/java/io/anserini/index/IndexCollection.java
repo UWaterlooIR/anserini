@@ -23,13 +23,11 @@ import io.anserini.analysis.TweetAnalyzer;
 import io.anserini.collection.DocumentCollection;
 import io.anserini.collection.FileSegment;
 import io.anserini.collection.SourceDocument;
-import io.anserini.index.generator.EmptyDocumentException;
-import io.anserini.index.generator.InvalidDocumentException;
-import io.anserini.index.generator.LuceneDocumentGenerator;
-import io.anserini.index.generator.SkippedDocumentException;
-import io.anserini.index.generator.WashingtonPostGenerator;
+import io.anserini.index.generator.*;
 import io.anserini.search.similarity.AccurateBM25Similarity;
 import io.anserini.search.similarity.ImpactSimilarity;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.time.DurationFormatUtils;
 import org.apache.commons.pool2.BasePooledObjectFactory;
@@ -42,7 +40,10 @@ import org.apache.http.HttpHost;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CredentialsProvider;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.TrustSelfSignedStrategy;
 import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.ssl.SSLContexts;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -71,18 +72,14 @@ import org.apache.lucene.analysis.th.ThaiAnalyzer;
 import org.apache.lucene.analysis.tr.TurkishAnalyzer;
 
 import org.apache.lucene.document.Document;
-import org.apache.lucene.index.ConcurrentMergeScheduler;
-import org.apache.lucene.index.DocValuesType;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.IndexWriterConfig;
-import org.apache.lucene.index.IndexableField;
-import org.apache.lucene.index.Term;
+import org.apache.lucene.index.*;
 import org.apache.lucene.search.similarities.BM25Similarity;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
 import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
 import org.apache.solr.common.SolrInputDocument;
+import org.apache.tika.exception.TikaException;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.index.IndexRequest;
@@ -96,7 +93,10 @@ import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.OptionHandlerFilter;
 import org.kohsuke.args4j.ParserProperties;
 
+import javax.net.ssl.SSLContext;
+import java.io.BufferedOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -107,12 +107,17 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.zip.GZIPOutputStream;
 
 public final class IndexCollection {
   private static final Logger LOG = LogManager.getLogger(IndexCollection.class);
@@ -151,6 +156,13 @@ public final class IndexCollection {
     public AtomicLong skipped = new AtomicLong();
 
     /**
+     * Counter for skipped non-English documents. These are cases documents are skipped when skipNonEnglish
+     * flag is enabled.
+     */
+    public AtomicLong nonEnglish = new AtomicLong();
+
+
+    /**
      * Counter for unexpected errors.
      */
     public AtomicLong errors = new AtomicLong();
@@ -161,6 +173,7 @@ public final class IndexCollection {
     final private IndexWriter writer;
     final private DocumentCollection collection;
     private FileSegment fileSegment;
+    private TarArchiveOutputStream tarOs;
 
     private LocalIndexerThread(IndexWriter writer, DocumentCollection collection, Path inputFile) {
       this.writer = writer;
@@ -187,10 +200,40 @@ public final class IndexCollection {
         // in order to call close() and clean up resources in case of exception
         this.fileSegment = segment;
 
+        if (args.compressPath != null) {
+          String compress_file_path = args.compressPath.concat(inputFile.getFileName().toString()).concat(".tar.gz");
+          new File(compress_file_path).getParentFile().mkdirs();
+          FileOutputStream fos = new FileOutputStream(compress_file_path);
+          GZIPOutputStream gos = new GZIPOutputStream(new BufferedOutputStream(fos));
+          this.tarOs = new TarArchiveOutputStream(gos);
+        }
+
+
         for (SourceDocument d : segment) {
           if (!d.indexable()) {
             counters.unindexable.incrementAndGet();
             continue;
+          }
+
+          if (args.skipNonEnglish){
+            try {
+              if (!d.isEnglish(d.contents())) {
+                counters.nonEnglish.incrementAndGet();
+                continue;
+              }
+            } catch (TikaException e){
+              counters.errors.incrementAndGet();
+              continue;
+            }
+          }
+
+          // Used for indexing distinct shardCount of a collection
+          if (args.shardCount > 1) {
+            int hash = Hashing.sha1().hashString(d.id(), Charsets.UTF_8).asInt() % args.shardCount;
+            if (hash != args.shardCurrent) {
+              counters.skipped.incrementAndGet();
+              continue;
+            }
           }
 
           Document doc;
@@ -217,6 +260,17 @@ public final class IndexCollection {
           } else {
             writer.addDocument(doc);
           }
+
+          if (args.compressPath != null) {
+            byte content[] = d.contents().getBytes();
+            TarArchiveEntry archive_entry = new TarArchiveEntry(d.id());
+            archive_entry.setSize(content.length);
+            tarOs.putArchiveEntry(archive_entry);
+
+            tarOs.write(content);
+            tarOs.closeArchiveEntry();
+          }
+
           cnt++;
           batch++;
 
@@ -252,6 +306,13 @@ public final class IndexCollection {
       } finally {
         if (fileSegment != null) {
             fileSegment.close();
+        }
+        if (tarOs != null) {
+          try {
+            tarOs.close();
+          } catch (IOException e) {
+            e.printStackTrace();
+          }
         }
       }
     }
@@ -291,6 +352,28 @@ public final class IndexCollection {
           if (!sourceDocument.indexable()) {
             counters.unindexable.incrementAndGet();
             continue;
+          }
+
+          if (args.skipNonEnglish){
+            try {
+              if (!sourceDocument.isEnglish(sourceDocument.contents())) {
+                counters.nonEnglish.incrementAndGet();
+                continue;
+              }
+            } catch (TikaException e){
+              counters.errors.incrementAndGet();
+              continue;
+            }
+          }
+
+
+          // Used for indexing distinct shardCount of a collection
+          if (args.shardCount > 1) {
+            int hash = Hashing.sha1().hashString(sourceDocument.id(), Charsets.UTF_8).asInt() % args.shardCount;
+            if (hash != args.shardCurrent) {
+              counters.skipped.incrementAndGet();
+              continue;
+            }
           }
 
           Document document;
@@ -459,6 +542,27 @@ public final class IndexCollection {
             continue;
           }
 
+          if (args.skipNonEnglish){
+            try {
+              if (!sourceDocument.isEnglish(sourceDocument.contents())) {
+                counters.nonEnglish.incrementAndGet();
+                continue;
+              }
+            } catch (TikaException e){
+              counters.errors.incrementAndGet();
+              continue;
+            }
+          }
+
+          // Used for indexing distinct shardCount of a collection
+          if (args.shardCount > 1) {
+            int hash = Hashing.sha1().hashString(sourceDocument.id(), Charsets.UTF_8).asInt() % args.shardCount;
+            if (hash != args.shardCurrent) {
+              counters.skipped.incrementAndGet();
+              continue;
+            }
+          }
+
           Document document;
           try {
             document = generator.createDocument(sourceDocument);
@@ -508,7 +612,7 @@ public final class IndexCollection {
           bulkRequest.add(new IndexRequest(indexName).id(sourceDocument.id()).source(builder));
 
           // sendBulkRequest when the batch size is reached OR the bulk size is reached
-          if (bulkRequest.numberOfActions() == args.esBatch || 
+          if (bulkRequest.numberOfActions() == args.esBatch ||
               bulkRequest.estimatedSizeInBytes() >= args.esBulk) {
             sendBulkRequest();
           }
@@ -576,7 +680,7 @@ public final class IndexCollection {
         LOG.info("Error sending bulkRequest. The 10 largest docs in this request are the following cord_uid: ");
         for (int i = 0; i < 10; i++) {
           IndexRequest doc = (IndexRequest) docs.get(i);
-          LOG.info(doc.id()); 
+          LOG.info(doc.id());
         }
       } finally {
         if (esClient != null) {
@@ -592,12 +696,21 @@ public final class IndexCollection {
 
   private class ESClientFactory extends BasePooledObjectFactory<RestHighLevelClient> {
     @Override
-    public RestHighLevelClient create() {
+    public RestHighLevelClient create() throws KeyStoreException, NoSuchAlgorithmException, KeyManagementException {
       final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
       credentialsProvider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(args.esUser, args.esPassword));
+      SSLContext sslContext = SSLContexts
+              .custom()
+              .loadTrustMaterial(TrustSelfSignedStrategy.INSTANCE)
+              .build();
       return new RestHighLevelClient(
-          RestClient.builder(new HttpHost(args.esHostname, args.esPort, "http"))
-              .setHttpClientConfigCallback(builder -> builder.setDefaultCredentialsProvider(credentialsProvider))
+          RestClient.builder(new HttpHost(args.esHostname, args.esPort, args.esSSL ? "https" : "http"))
+              .setHttpClientConfigCallback(builder -> args.esSSL ?
+                      builder.setDefaultCredentialsProvider(credentialsProvider)
+                          .setSSLContext(sslContext)
+                          .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                      : builder.setDefaultCredentialsProvider(credentialsProvider)
+              )
               .setRequestConfigCallback(builder -> builder.setConnectTimeout(args.esConnectTimeout).setSocketTimeout(args.esSocketTimeout))
       );
     }
@@ -673,6 +786,7 @@ public final class IndexCollection {
       LOG.info("Elasticsearch index: " + args.esIndex);
       LOG.info("Elasticsearch hostname: " + args.esHostname);
       LOG.info("Elasticsearch host port: " + args.esPort);
+      LOG.info("Elasticsearch use HTTPS(SSL): " + args.esSSL);
       LOG.info("Elasticsearch client connect timeout (in ms): " + args.esConnectTimeout);
       LOG.info("Elasticsearch client socket timeout (in ms): " + args.esSocketTimeout);
       LOG.info("Elasticsearch pool size: " + args.esPoolSize);
@@ -924,11 +1038,14 @@ public final class IndexCollection {
 
     LOG.info(String.format("Indexing Complete! %,d documents indexed", numIndexed));
     LOG.info("============ Final Counter Values ============");
-    LOG.info(String.format("indexed:     %,12d", counters.indexed.get()));
-    LOG.info(String.format("unindexable: %,12d", counters.unindexable.get()));
-    LOG.info(String.format("empty:       %,12d", counters.empty.get()));
-    LOG.info(String.format("skipped:     %,12d", counters.skipped.get()));
-    LOG.info(String.format("errors:      %,12d", counters.errors.get()));
+    LOG.info(String.format("indexed:                 %,12d", counters.indexed.get()));
+    LOG.info(String.format("unindexable:             %,12d", counters.unindexable.get()));
+    LOG.info(String.format("empty:                   %,12d", counters.empty.get()));
+    LOG.info(String.format("skipped:                 %,12d", counters.skipped.get()));
+    if (args.skipNonEnglish){
+      LOG.info(String.format("skipped non-English:     %,12d", counters.nonEnglish.get()));
+    }
+    LOG.info(String.format("errors:                  %,12d", counters.errors.get()));
 
     final long durationMillis = TimeUnit.MILLISECONDS.convert(System.nanoTime() - start, TimeUnit.NANOSECONDS);
     LOG.info(String.format("Total %,d documents indexed in %s", numIndexed,
